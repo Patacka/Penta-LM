@@ -15,6 +15,9 @@ from torch.cuda.amp import autocast, GradScaler
 
 torch.backends.cuda.matmul.allow_tf32 = True
 class ValueHeadModuleFn(nn.Module):
+    """
+    Defines a neural network module for estimating the value of states (value head) in reinforcement learning.
+    """
     def __init__(self, hidden_size, pre_encoded_input=True):
         """
         Initialisiert das Value Head Modul.
@@ -42,6 +45,9 @@ class ValueHeadModuleFn(nn.Module):
 
 
 class PPOUpdater(BaseUpdater):
+    """
+    Implements the PPO algorithm for training the policy and value networks.
+    """
     def __init__(self, model, tokenizer, ip, lr=3e-5):
         super().__init__()
         self.model = model
@@ -55,13 +61,15 @@ class PPOUpdater(BaseUpdater):
         self.scaler = GradScaler()
         self._pad_token = 0
 
+
     def compute_loss(self, obs, actions, log_probs, values,
                      dist, advantages, returns, clip_ratio=0.2, gamma=0.99, lambda_gae=0.95):
+        # Computes the loss for updating the model.
         value_loss_coef = 0.6
         entropy_coef = 0.02
         # Berechnet den Vorteil und den generalisierten Vorteil (Generalized Advantage Estimation, GAE)
 
-        advantages, returns = advantages , returns
+        advantages, returns = advantages, returns
         ratio = torch.exp(log_probs - log_probs.detach())
         # Berechnet den PPO-Clip-Verlust
         print(ratio.size())
@@ -75,7 +83,11 @@ class PPOUpdater(BaseUpdater):
         loss = policy_loss + value_loss_coef * value_loss - entropy_coef * entropy_loss
 
         return loss
+
+
+
     def cal_scores(self, encoded_input, outputs):
+        # Calculates scores for actions based on model outputs.
         print("-" * 100)
         logits = outputs["logits"][:, 0:-1, :]
         output_tokens = encoded_input["input_ids"][:, 1:]
@@ -90,7 +102,11 @@ class PPOUpdater(BaseUpdater):
         token_probs = torch.clamp(masked_token_probs, min=1e-6)
         minibatch_probs = token_probs.sum(-1)
         return minibatch_probs.cpu()
+
+
+
     def preprocess_obs_to_tensor(self, texts):
+        # Preprocesses observations into tensors for the model.
         task_prompt = (
             f"Based on this observation: '{texts}' "
             f"generate concise the next action for pentesting IP the {self.ip}? Provide only the action itself including "
@@ -118,8 +134,9 @@ class PPOUpdater(BaseUpdater):
         action = self.remove_input_text(action, "<|im_end|>")
         return action, value_predictions, log_probs, action_id, probas
 
+
     def update(self, observation, action, advantages, returns, log_probs, values, dist):
-        # Berechnet den Verlust und führt einen Optimierungsschritt durch
+        # Updates the model based on observations and actions.
 
         observations = observation
         actions = action
@@ -144,6 +161,7 @@ class PPOUpdater(BaseUpdater):
         return loss.item()
 
     def remove_input_text(self, text, text_to_remove):
+        # Removes the input text from generated actions to clean up the output.
         return text.replace(text_to_remove, '')
 
     def save_model(self, filepath):
@@ -245,9 +263,9 @@ class Buffer:
         return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
 
 
+# Environment and training setup
 ip = "10.10.97.159"
-num_epoch_steps = 8
-# Initialisierung und Verwendung des PPOUpdaters
+num_epoch_steps = 2
 model_name = "cognitivecomputations/dolphin-2.6-mistral-7b-dpo-laser"
 tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype=torch.float16, output_hidden_states=True)
 model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, output_hidden_states=True)
@@ -258,30 +276,10 @@ model.gradient_checkpointing_enable()
 save_dir = "./Penta-LM"
 updater = PPOUpdater(model, tokenizer, ip)
 
-
 total_reward = 0
-# updater.perform_update(experiences)
 env = PentestEnvLLM()
 observation = env.reset()
 buff = Buffer(num_epoch_steps)
-
-def remove_input_text(text, text_to_remove):
-    return text.replace(text_to_remove, '')
-
-
-# def generate_action(observation, ip):
-#     task_prompt = (
-#         f"Based on this observation: '{observation}' "
-#         f"generate concise the next action for pentesting IP the {ip}? Provide only the action itself including the "
-#         f"IP, without any additional characters, explanation."
-#         f"Your Goal is to find and open the flag.txt file on the target system."
-#     )
-#     task = action_model(task_prompt, max_new_tokens=2024, temperature=0.5, top_k=50, top_p=0.95)
-#     task = task[0]["generated_text"]
-#     task = remove_input_text(task, task_prompt)
-#     lines = task.split('\n')
-#     task = '\n'.join(lines[1:]) if len(lines) > 1 else ""
-#     return task
 
 
 def _print_trainable_parameters(model):
@@ -296,9 +294,8 @@ def _print_trainable_parameters(model):
     )
 
 
-#_print_trainable_parameters(model)
 
-
+# Training loop
 with torch.autograd.detect_anomaly():
     for i in range(0, 256):
         for episode in range(0, num_epoch_steps):
