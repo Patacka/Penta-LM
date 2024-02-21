@@ -3,14 +3,14 @@ from pynvml import *
 import numpy as np
 import torch
 from torch.distributions import Categorical
-from torch.optim import Adam
+from torch.optim import SGD
 import torch.nn as nn
 from pentestenv import PentestEnvLLM
 from lamorel import BaseUpdater
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, AdamWeightDecay
 import scipy
-
+import matplotlib.pyplot as plt
 from torch.cuda.amp import autocast, GradScaler
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -54,7 +54,7 @@ class PPOUpdater(BaseUpdater):
         self.tokenizer = tokenizer
         self.ip = ip
         self.trainable_params = (p for n, p in self.model.named_parameters())
-        self.optimizer = Adam(self.trainable_params, lr=lr)
+        self.optimizer = SGD(self.trainable_params, lr=lr)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.value_head = ValueHeadModuleFn(hidden_size=self.model.config.hidden_size).to(self.device)
         self.vals = np.zeros(256, dtype=np.float32)
@@ -88,7 +88,6 @@ class PPOUpdater(BaseUpdater):
 
     def cal_scores(self, encoded_input, outputs):
         # Calculates scores for actions based on model outputs.
-        print("-" * 100)
         logits = outputs["logits"][:, 0:-1, :]
         output_tokens = encoded_input["input_ids"][:, 1:]
         tokens_logprobs = torch.gather(logits, 2, output_tokens[:, :, None]).squeeze(-1).to(torch.float32)
@@ -114,14 +113,12 @@ class PPOUpdater(BaseUpdater):
             f"Your Goal is to find and open the flag.txt file by exploit a vulnerability on the target system."
         )
         encoded_inputs = tokenizer(task_prompt, padding=True, truncation=True, return_tensors="pt").to(self.device)
-        print(f"Encoded inputs: {encoded_inputs}")
+
         inputs = {key: value.to(self.device) for key, value in encoded_inputs.items()}
         outputs = model(**inputs)
-        print(outputs)
         model_head = outputs['hidden_states'][-1]
         value_predictions = self.value_head(model_head)
         score = self.cal_scores(encoded_inputs, outputs)
-        print(score)
         probas = torch.distributions.Categorical(logits=score)
         smapeld_action = probas.sample()
         log_probs = probas.log_prob(smapeld_action)
@@ -153,8 +150,6 @@ class PPOUpdater(BaseUpdater):
         self.optimizer.zero_grad()
         with torch.autograd.detect_anomaly():
             loss.backward(retain_graph=True)
-        print("loss:")
-        print(loss)
         torch.nn.utils.clip_grad_norm_(self.trainable_params, 0.5)
 
         self.optimizer.step()
@@ -264,8 +259,8 @@ class Buffer:
 
 
 # Environment and training setup
-ip = "10.10.97.159"
-num_epoch_steps = 2
+ip = "10.10.73.157"
+num_epoch_steps = 10
 model_name = "cognitivecomputations/dolphin-2.6-mistral-7b-dpo-laser"
 tokenizer = AutoTokenizer.from_pretrained(model_name, torch_dtype=torch.float16, output_hidden_states=True)
 model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, output_hidden_states=True)
@@ -293,11 +288,30 @@ def _print_trainable_parameters(model):
         f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
     )
 
+def plot_rewards_steps(rewards, schritte, dateiname, y_axis):
+    plt.figure(figsize=(10, 6))
+    plt.plot(schritte, rewards, marker='o', linestyle='-', color='b')
+    plt.title('Belohnungen pro Schritt')
+    plt.xlabel('Schritte')
+    plt.ylabel(y_axis)
+    plt.grid(True)
+
+    # Sicherstellen, dass das Verzeichnis für den Dateinamen existiert
+    if not os.path.exists(os.path.dirname(dateiname)):
+        os.makedirs(os.path.dirname(dateiname), exist_ok=True)
+
+    plt.savefig(dateiname)
+    plt.close()
+
 
 
 # Training loop
 with torch.autograd.detect_anomaly():
-    for i in range(0, 256):
+    loss_graph = []
+    loss_steps = []
+    for i in range(0, 100):
+        rewards_graph = []
+        episode_graph = []
         for episode in range(0, num_epoch_steps):
             #action = generate_action(observation, ip)
 
@@ -306,18 +320,26 @@ with torch.autograd.detect_anomaly():
             action, values, log_probs, action_id, dist = updater.preprocess_obs_to_tensor(observation)
             next_observation, reward, done, info = env.step(action)
             total_reward += reward
+            rewards_graph.append(total_reward)
+            episode_graph.append(episode)
             buff.store(observation, action_id, reward, values, log_probs)
                 #print(experiences['observations'])
             print("=" * 100)
             print(
-                f"episode: {episode} \nobservation: {observation} {action} \nreward: {total_reward} \ndone: {done} \ninfo: {info}")
+                f"episode: {episode} \nobservation: {observation} \nAction: {action} \nreward: {total_reward} \ndone: {done} \ninfo: {info}")
             print("=" * 100)
             observation = next_observation
             if episode == num_epoch_steps - 1:
                 buff.finish_path()
+            data_name = 'graphs/rewards_vs_steps' + str(i) + str(episode) + '.png'
+        plot_rewards_steps(rewards_graph, episode_graph, data_name, "Schritte")
         trajec = buff.get()
         loss = updater.update(trajec['obs'], trajec['act'], trajec['adv'], trajec['ret'], trajec['logp'], trajec['val'], dist)
             #updater.save_model(os.path.join(save_dir, "model.pt"))
         print(f"Loss after episode {episode}: {loss}")
-    #           updater.save_model(os.path.join(save_dir, "model.pt"))
+        loss_graph.append(loss)
+        loss_steps.append(episode)
+        data_name = 'graphs/loss_vs_steps' + str(i) + '.png'
+        plot_rewards_steps(loss_graph, loss_steps, data_name, "Loss")
+    #updater.save_model(os.path.join(save_dir, "model.pt"))
     #           print(f"Loss after episode {episode}: {loss}")
