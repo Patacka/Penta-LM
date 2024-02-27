@@ -1,0 +1,52 @@
+llm_client:
+  model_path: uukuguy/speechless-code-mistral-7b-v1.0 #Qwen/Qwen1.5-0.5B #
+  generation_args:
+    max_new_tokens: 128
+    do_sample: true
+    temperature: 0.5
+    top_k: 40
+    top_p: 0.85
+PPO_updater:
+  lr: 2e-6
+  minibatch_size: 4 
+  clip_eps: .2 
+  entropy_loss_coef: 0.01
+  value_loss_coef: .5
+  gamma: .99
+  lambda_gae: .95
+  max_grad_norm: 0.5
+lamorel_args:
+  log_level: info
+  allow_subgraph_use_whith_gradient: false
+  distributed_setup_args:
+    n_rl_processes: 1
+    n_llm_processes: 1
+  accelerate_args:
+    num_machines: 1
+    config_file: accelerate_config.yaml
+  llm_args:
+    model_type: causal
+    model_path: cognitivecomputations/dolphin-2.6-mistral-7b-dpo-laser #unsloth/tinyllama-bnb-4bit #
+    pretrained: true
+    minibatch_size: 4
+    pre_encode_inputs: false
+    load_in_4bit: true
+    parallelism:
+      use_gpu: true
+      model_parallelism_size: 1
+      synchronize_gpus_after_scoring: false
+      empty_cuda_cache_after_scoring: false
+    generation_args:
+      max_new_tokens: 128
+      num_return_sequences: 2
+      do_sample: true
+rl_script_args:
+  path: ???
+  seed: 41
+  max_episode_length: 10
+  epochs: 100
+  steps_per_epoch: 3
+  save_freq: 50
+  save_dir: checkpoints
+  load_dir: # The folder containing the `model.checkpoint`
+            # file, whenever you wand to load one.
