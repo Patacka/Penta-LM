@@ -84,6 +84,8 @@ class PPOUpdater(BaseUpdater):
     def __init__(self, config: DictConfig):
         super(PPOUpdater, self).__init__()
         self.minibatch_size = config.minibatch_size
+        self.gradient_accumulation_steps = config.gradient_accumulation_steps
+        self.epochs = config.epochs
         self.lr = config.lr
         self.clip_eps = config.clip_eps
         self.value_loss_coef = config.value_loss_coef
@@ -100,63 +102,61 @@ class PPOUpdater(BaseUpdater):
             if kwargs["load_dir"] and os.path.exists(kwargs["load_dir"] + "/optimizer.checkpoint"):
                 self.logger.info(f"Loading optimizer state from {kwargs['load_dir']}")
                 self.optimizer.load_state_dict(torch.load(kwargs["load_dir"] + "/optimizer.checkpoint"))
+        else:
+            self.optimizer.zero_grad()
 
         current_process_buffer = {}
         for k in ['action_indices', 'advantages', 'returns', 'logprobs', 'values']:
-            current_process_buffer[k] = kwargs[k][_current_batch_ids].to(self._llm_module.device)
+            current_process_buffer[k] = kwargs[k][_current_batch_ids]
 
-        epoch_losses = {
-            "value": [],
-            "policy": [],
-            "entropy": [],
-            "loss": []
-        }
+        epochs_losses = {k: [0.]*self.epochs for k in ("value", "policy", "entropy", "total")}
 
         n_minibatches = math.ceil(len(contexts) / self.minibatch_size)
-        for step in range(n_minibatches):
-            _start_idx = step * self.minibatch_size
-            _stop_idx = min((step + 1) * self.minibatch_size, len(contexts))
+        for i in tqdm(range(self.epochs), ascii=" " * 9 + ">", ncols=100):
+            for step in range(n_minibatches):
+                _start_idx = step * self.minibatch_size
+                _stop_idx = min((step + 1) * self.minibatch_size, len(contexts))
 
-            _contexts = contexts[_start_idx:_stop_idx]
-            _candidates = candidates[_start_idx:_stop_idx]
+                _contexts = contexts[_start_idx:_stop_idx]
+                _candidates = candidates[_start_idx:_stop_idx]
 
-            output = self._llm_module(['score', 'value'], contexts=_contexts, candidates=_candidates,
-                                      require_grad=True, minibatch_size=self.minibatch_size)
-            scores = torch.stack([_o['score'] for _o in output]).squeeze().to(self._llm_module.device)
-            probas = Categorical(logits=scores)
-            values = torch.stack([_o["value"][0] for _o in output]).squeeze()
+                output = self._llm_module(['score', 'value'], contexts=_contexts, candidates=_candidates,
+                                        require_grad=True, minibatch_size=self.minibatch_size)
+                scores = torch.stack([_o['score'] for _o in output]).squeeze()
+                probas = Categorical(logits=scores)
+                values = torch.stack([_o["value"][0].cpu() for _o in output]).squeeze()
 
-            # Compute entropy loss
-            entropy_loss = - probas.entropy().mean()
-            epoch_losses["entropy"].append(entropy_loss.detach().cpu().item())
+                # Compute entropy loss
+                entropy_loss = - probas.entropy().mean()
+                epochs_losses["entropy"][i] += entropy_loss.detach().cpu().item()
 
-            # Compute policy loss
-            log_prob = probas.log_prob(current_process_buffer['action_indices'][_start_idx:_stop_idx])
-            ratio = torch.exp(log_prob - current_process_buffer['logprobs'][_start_idx:_stop_idx])
-            clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
-            adv = current_process_buffer['advantages'][_start_idx:_stop_idx]
-            policy_loss = -(torch.min(ratio * adv, clipped_ratio * adv)).mean()
-            epoch_losses["policy"].append(policy_loss.detach().cpu().item())
+                # Compute policy loss
+                log_prob = probas.log_prob(current_process_buffer['action_indices'][_start_idx:_stop_idx])
+                ratio = torch.exp(log_prob - current_process_buffer['logprobs'][_start_idx:_stop_idx])
+                clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
+                adv = current_process_buffer['advantages'][_start_idx:_stop_idx]
+                policy_loss = -(torch.min(ratio * adv, clipped_ratio * adv)).mean()
+                epochs_losses["policy"][i] += policy_loss.detach().cpu().item()
 
-            # Compute value loss
-            ret = current_process_buffer['returns'][_start_idx:_stop_idx]
-            unclipped_value_error = ((values - ret) ** 2)
-            val = current_process_buffer['values'][_start_idx:_stop_idx]
-            clipped_values = torch.clamp(values - val, -self.clip_eps, self.clip_eps) + val
-            clipped_value_error = ((clipped_values - ret) ** 2)
-            value_loss = torch.max(unclipped_value_error, clipped_value_error).mean()
-            epoch_losses["value"].append(value_loss.detach().cpu().item())
+                # Compute value loss
+                ret = current_process_buffer['returns'][_start_idx:_stop_idx]
+                unclipped_value_error = ((values - ret) ** 2)
+                val = current_process_buffer['values'][_start_idx:_stop_idx]
+                clipped_values = torch.clamp(values - val, -self.clip_eps, self.clip_eps) + val
+                clipped_value_error = ((clipped_values - ret) ** 2)
+                value_loss = torch.max(unclipped_value_error, clipped_value_error).mean()
+                epochs_losses["value"][i] += value_loss.detach().cpu().item()
 
-            # Compute final loss
-            loss = policy_loss + self.value_loss_coef * value_loss + self.entropy_loss_coef * entropy_loss
-            epoch_losses["loss"].append(loss.detach().cpu().item())
+                # Compute final loss
+                loss = policy_loss + self.value_loss_coef * value_loss + self.entropy_loss_coef * entropy_loss
+                epochs_losses["total"][i] += loss.detach().cpu().item()
 
-            # Backward
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self._iterator_trainable_params, self.max_grad_norm, error_if_nonfinite=True)
-            self.optimizer.step()
-        
+                loss.backward()
+                if (step % self.gradient_accumulation_steps == 0 and step != 0) or (step + 1 == n_minibatches):
+                    torch.nn.utils.clip_grad_norm_(self._iterator_trainable_params, self.max_grad_norm, error_if_nonfinite=True)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
         if kwargs["save_model"] and accelerator.process_index == 1:
             self.logger.info("Saving model...")
             model_state_dict = {
@@ -166,8 +166,7 @@ class PPOUpdater(BaseUpdater):
             torch.save(self.optimizer.state_dict(), kwargs["save_dir"] + "/optimizer.checkpoint")
             self.logger.info("Model saved")
 
-        return {'loss': np.mean(epoch_losses["loss"]), 'value_loss': np.mean(epoch_losses["value"]),
-                'policy_loss': np.mean(epoch_losses["policy"]), 'entropy_loss': np.mean(epoch_losses["entropy"])}
+        return {f"{k}_loss": np.mean(np.array(epochs_losses[k])/n_minibatches) for k in ("value", "policy", "entropy", "total")}
 
 
 # Adopted from lamorel/examples/PPO_finetuning
@@ -326,7 +325,7 @@ def main(config: DictConfig):
             action_idx = action_dist.sample()
 
             score = action_dist.log_prob(action_idx)
-            value = agent.custom_module_fns(['value'], contexts=[task_prompt])[ZERO_AS_BS_IS_1]['value'][0]
+            value = agent.custom_module_fns(['value'], contexts=[task_prompt])[ZERO_AS_BS_IS_1]['value'][0].cpu()
 
             action = actions[action_idx]['text']
             # I don't get two lines below:
@@ -391,7 +390,7 @@ def main(config: DictConfig):
         pentest_history._span.end_time_ms = time() * 1000
         
         wandb.log({
-            "Loss": update_results['loss'],
+            "Loss": update_results['total_loss'],
             "Policy Loss": update_results['policy_loss'],
             "Value Loss": update_results['value_loss'],
             "Entropy Loss": update_results['entropy_loss']
@@ -400,7 +399,7 @@ def main(config: DictConfig):
 
         history["actions"].extend(trajectories['act_idx'])
         history["observations"].extend(trajectories['obs'])
-        rl_script_logger.info(f"Update loss: {update_results['loss']}")
+        rl_script_logger.info(f"Update loss: {update_results['total_loss']}")
     
     agent.close()
     wandb.finish()

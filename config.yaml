@@ -9,6 +9,8 @@ llm_client:
 PPO_updater:
   lr: 2e-6
   minibatch_size: 4 
+  epochs: 1
+  gradient_accumulation_steps: 4
   clip_eps: .2 
   entropy_loss_coef: 0.01
   value_loss_coef: .5
@@ -39,7 +41,7 @@ lamorel_args:
     generation_args:
       max_new_tokens: 128
       num_return_sequences: 2
-      do_sample: true
+      num_beams: 3
 rl_script_args:
   path: ???
   seed: 41
